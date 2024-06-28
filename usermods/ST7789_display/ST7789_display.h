@@ -86,7 +86,7 @@ class St7789DisplayUsermod : public Usermod {
      * on the middle rows. Based 24 or 12 hour depending on
      * the useAMPM configuration.
      */
-    void showTime() {
+    /*void showTime() {
         if (!ntpEnabled) return;
         char lineBuffer[LINE_BUFFER_SIZE];
 
@@ -101,7 +101,7 @@ class St7789DisplayUsermod : public Usermod {
         sprintf_P(lineBuffer, PSTR("%s %2d "), monthShortStr(currentMonth), day(localTime));
         tft.setTextColor(TFT_SILVER);
         tft.setCursor(84, 0);
-        tft.setTextSize(2);
+        tft.setTextSize(5);
         tft.print(lineBuffer);
 
         byte showHour = hourCurrent;
@@ -120,16 +120,16 @@ class St7789DisplayUsermod : public Usermod {
 
         sprintf_P(lineBuffer, PSTR("%2d:%02d"), (useAMPM ? showHour : hourCurrent), minuteCurrent);
         tft.setTextColor(TFT_WHITE);
-        tft.setTextSize(4);
+        tft.setTextSize(1);
         tft.setCursor(60, 24);
         tft.print(lineBuffer);
 
-        tft.setTextSize(2);
+        tft.setTextSize(1);
         tft.setCursor(186, 24);
         //sprintf_P(lineBuffer, PSTR("%02d"), secondCurrent);
         if (useAMPM) tft.print(isAM ? "AM" : "PM");
         //else         tft.print(lineBuffer);
-    }
+    }*/
 
   public:
     //Functions called by WLED
@@ -149,7 +149,7 @@ class St7789DisplayUsermod : public Usermod {
         tft.setTextColor(TFT_RED);
         tft.setCursor(60, 100);
         tft.setTextDatum(MC_DATUM);
-        tft.setTextSize(2);
+        tft.setTextSize(1);
         tft.print("Loading...");
         if (TFT_BL >= 0) 
         {
@@ -235,7 +235,7 @@ class St7789DisplayUsermod : public Usermod {
 
         showTime();
 
-        tft.setTextSize(2);
+        tft.setTextSize(1);
 
         // Wifi name
         tft.setTextColor(TFT_GREEN);
