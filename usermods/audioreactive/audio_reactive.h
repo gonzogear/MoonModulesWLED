@@ -237,9 +237,9 @@ static uint8_t useInputFilter = 0;                        // enables low-cut fil
 //WLEDMM add experimental settings
 static uint8_t micLevelMethod = 0;                        // 0=old "floating" miclev, 1=new  "freeze" mode, 2=fast freeze mode (mode 2 may not work for you)
 #if defined(CONFIG_IDF_TARGET_ESP32S2) || defined(CONFIG_IDF_TARGET_ESP32C3)
-static uint8_t averageByRMS = false;                      // false: use mean value, true: use RMS (root mean squared). use simpler method on slower MCUs.
+static constexpr uint8_t averageByRMS = false;                      // false: use mean value, true: use RMS (root mean squared). use simpler method on slower MCUs.
 #else
-static uint8_t averageByRMS = true;                       // false: use mean value, true: use RMS (root mean squared). use better method on fast MCUs.
+static constexpr uint8_t averageByRMS = true;                       // false: use mean value, true: use RMS (root mean squared). use better method on fast MCUs.
 #endif
 static uint8_t freqDist = 0;                              // 0=old 1=rightshift mode
 
@@ -330,6 +330,7 @@ static float FFT_MajPeakSmth = 1.0f;            // FFT: (peak) frequency, smooth
 static float fftTaskCycle = 0;      // avg cycle time for FFT task
 static float fftTime = 0;           // avg time for single FFT
 static float sampleTime = 0;        // avg (blocked) time for reading I2S samples
+static float filterTime = 0;        // avg time for filtering I2S samples
 #endif
 
 // FFT Task variables (filtering and post-processing)
@@ -381,7 +382,6 @@ constexpr float binWidth = SAMPLE_RATE / (float)samplesFFT; // frequency range o
 
 
 // Create FFT object
-#ifdef UM_AUDIOREACTIVE_USE_NEW_FFT
 // lib_deps += https://github.com/kosme/arduinoFFT#develop @ 1.9.2
 #if  !defined(CONFIG_IDF_TARGET_ESP32S2) && !defined(CONFIG_IDF_TARGET_ESP32C3)
 // these options actually cause slow-down on -S2 (-S2 doesn't have floating point hardware)
@@ -390,13 +390,8 @@ constexpr float binWidth = SAMPLE_RATE / (float)samplesFFT; // frequency range o
 #endif
 #define sqrt(x) sqrtf(x)             // little hack that reduces FFT time by 10-50% on ESP32 (as alternative to FFT_SQRT_APPROXIMATION)
 #define sqrt_internal sqrtf          // see https://github.com/kosme/arduinoFFT/pull/83
-#else
-  // around 50% slower on -S2
-// lib_deps += https://github.com/blazoncek/arduinoFFT.git
-#endif
 #include <arduinoFFT.h>
 
-#ifdef UM_AUDIOREACTIVE_USE_NEW_FFT
 #if defined(FFT_LIB_REV) && FFT_LIB_REV > 0x19
   // arduinoFFT 2.x has a slightly different API
   static ArduinoFFT<float> FFT = ArduinoFFT<float>( vReal, vImag, samplesFFT, SAMPLE_RATE, true);
@@ -404,9 +399,6 @@ constexpr float binWidth = SAMPLE_RATE / (float)samplesFFT; // frequency range o
   // recommended version optimized by @softhack007 (API version 1.9)
   static float windowWeighingFactors[samplesFFT] = {0.0f}; // cache for FFT windowing factors
   static ArduinoFFT<float> FFT = ArduinoFFT<float>( vReal, vImag, samplesFFT, SAMPLE_RATE, windowWeighingFactors);
-#endif
-#else
-static arduinoFFT FFT = arduinoFFT(vReal, vImag, samplesFFT, SAMPLE_RATE);
 #endif
 
 // Helper functions
@@ -436,7 +428,7 @@ static float fftAddAvgRMS(int from, int to) {
 
 static float fftAddAvg(int from, int to) {
   if (from == to) return vReal[from];              // small optimization
-  if (averageByRMS) return fftAddAvgRMS(from, to); // use SMS
+  if (averageByRMS) return fftAddAvgRMS(from, to); // use RMS
   else return fftAddAvgLin(from, to);              // use linear average
 }
 
@@ -534,7 +526,7 @@ void FFTcode(void * parameter)
       uint64_t sampleTimeInMillis = (esp_timer_get_time() - start +5ULL) / 10ULL; // "+5" to ensure proper rounding
       sampleTime = (sampleTimeInMillis*3 + sampleTime*7)/10.0; // smooth
     }
-    start = esp_timer_get_time(); // start measuring FFT time
+    start = esp_timer_get_time(); // start measuring filter time
 #endif
 
     xLastWakeTime = xTaskGetTickCount();       // update "last unblocked time" for vTaskDelay
@@ -562,12 +554,23 @@ void FFTcode(void * parameter)
 
     // band pass filter - can reduce noise floor by a factor of 50
     // downside: frequencies below 100Hz will be ignored
+   bool doDCRemoval = false; // DCRemove is only necessary if we don't use any kind of low-cut filtering
    if ((useInputFilter > 0) && (useInputFilter < 99)) {
       switch(useInputFilter) {
         case 1: runMicFilter(samplesFFT, vReal); break;                   // PDM microphone bandpass
         case 2: runDCBlocker(samplesFFT, vReal); break;                   // generic Low-Cut + DC blocker (~40hz cut-off)
+        default: doDCRemoval = true; break;
       }
+    } else doDCRemoval = true;
+
+#if defined(WLED_DEBUG) || defined(SR_DEBUG)|| defined(SR_STATS)
+    // timing measurement
+    if (start < esp_timer_get_time()) { // filter out overflows
+      uint64_t filterTimeInMillis = (esp_timer_get_time() - start +5ULL) / 10ULL; // "+5" to ensure proper rounding
+      filterTime = (filterTimeInMillis*3 + filterTime*7)/10.0; // smooth
     }
+    start = esp_timer_get_time(); // start measuring FFT time
+#endif
 
     // set imaginary parts to 0
     memset(vImag, 0, sizeof(vImag));
@@ -616,8 +619,7 @@ void FFTcode(void * parameter)
     if (fabsf(volumeSmth) > 0.25f) { // noise gate open
       if ((skipSecondFFT == false) || (isFirstRun == true)) {
         // run FFT (takes 2-3ms on ESP32, ~12ms on ESP32-S2, ~30ms on -C3)
-        #ifdef UM_AUDIOREACTIVE_USE_NEW_FFT
-        FFT.dcRemoval();                                            // remove DC offset
+        if (doDCRemoval) FFT.dcRemoval();                                            // remove DC offset
         #if !defined(FFT_PREFER_EXACT_PEAKS)
           FFT.windowing( FFTWindow::Flat_top, FFTDirection::Forward);        // Weigh data using "Flat Top" function - better amplitude accuracy
         #else
@@ -626,19 +628,6 @@ void FFTcode(void * parameter)
         FFT.compute( FFTDirection::Forward );                       // Compute FFT
         FFT.complexToMagnitude();                                   // Compute magnitudes
         vReal[0] = 0;   // The remaining DC offset on the signal produces a strong spike on position 0 that should be eliminated to avoid issues.
-        #else
-        FFT.DCRemoval(); // let FFT lib remove DC component, so we don't need to care about this in getSamples()
-
-        //FFT.Windowing( FFT_WIN_TYP_HAMMING, FFT_FORWARD );        // Weigh data - standard Hamming window
-        //FFT.Windowing( FFT_WIN_TYP_BLACKMAN, FFT_FORWARD );       // Blackman window - better side freq rejection
-        #if !defined(FFT_PREFER_EXACT_PEAKS)
-          FFT.Windowing( FFT_WIN_TYP_FLT_TOP, FFT_FORWARD );        // Flat Top Window - better amplitude accuracy
-        #else
-          FFT.Windowing( FFT_WIN_TYP_BLACKMAN_HARRIS, FFT_FORWARD );// Blackman-Harris - excellent sideband rejection
-        #endif
-        FFT.Compute( FFT_FORWARD );                             // Compute FFT
-        FFT.ComplexToMagnitude();                               // Compute magnitudes
-        #endif
 
         float last_majorpeak = FFT_MajorPeak;
         float last_magnitude = FFT_Magnitude;
@@ -649,15 +638,11 @@ void FFTcode(void * parameter)
           vReal[binInd] *= pinkFactors[binInd];
         #endif
 
-        #ifdef UM_AUDIOREACTIVE_USE_NEW_FFT
         #if defined(FFT_LIB_REV) && FFT_LIB_REV > 0x19
           // arduinoFFT 2.x has a slightly different API
           FFT.majorPeak(&FFT_MajorPeak, &FFT_Magnitude);
         #else
           FFT.majorPeak(FFT_MajorPeak, FFT_Magnitude);                // let the effects know which freq was most dominant
-        #endif
-        #else
-          FFT.MajorPeak(&FFT_MajorPeak, &FFT_Magnitude);
         #endif
 
         if (FFT_MajorPeak < (SAMPLE_RATE /  samplesFFT)) {FFT_MajorPeak = 1.0f; FFT_Magnitude = 0;}                  // too low - use zero
@@ -2271,7 +2256,7 @@ class AudioReactive : public Usermod {
     void onUpdateBegin(bool init)
     {
 #ifdef WLED_DEBUG
-      fftTime = sampleTime = 0;
+      fftTime = sampleTime = filterTime = 0;
 #endif
       // gracefully suspend FFT task (if running)
       disableSoundProcessing = true;
@@ -2532,17 +2517,22 @@ class AudioReactive : public Usermod {
         infoArr.add(roundf(sampleTime)/100.0f);
         infoArr.add(" ms");
 
+        infoArr = user.createNestedArray(F("Filtering time"));
+        infoArr.add(roundf(filterTime)/100.0f);
+        infoArr.add(" ms");
+
         infoArr = user.createNestedArray(F("FFT time"));
         infoArr.add(roundf(fftTime)/100.0f);
         if ((fftTime/100) >= FFT_MIN_CYCLE) // FFT time over budget -> I2S buffer will overflow 
           infoArr.add("<b style=\"color:red;\">! ms</b>");
-        else if ((fftTime/80 + sampleTime/80) >= FFT_MIN_CYCLE) // FFT time >75% of budget -> risk of instability
+        else if ((fftTime/85 + filterTime/85 + sampleTime/85) >= FFT_MIN_CYCLE) // FFT time >75% of budget -> risk of instability
           infoArr.add("<b style=\"color:orange;\"> ms!</b>");
         else
           infoArr.add(" ms");
 
         DEBUGSR_PRINTF("AR I2S cycle time: %5.2f ms\n", roundf(fftTaskCycle)/100.0f);
         DEBUGSR_PRINTF("AR Sampling time : %5.2f ms\n", roundf(sampleTime)/100.0f);
+        DEBUGSR_PRINTF("AR filter time   : %5.2f ms\n", roundf(filterTime)/100.0f);
         DEBUGSR_PRINTF("AR FFT time      : %5.2f ms\n", roundf(fftTime)/100.0f);
         #endif
         #endif
@@ -2657,7 +2647,7 @@ class AudioReactive : public Usermod {
       JsonObject poweruser = top.createNestedObject("experiments");
       poweruser[F("micLev")] = micLevelMethod;
       poweruser[F("freqDist")] = freqDist;
-      poweruser[F("freqRMS")] = averageByRMS;
+      //poweruser[F("freqRMS")] = averageByRMS;
 
       JsonObject freqScale = top.createNestedObject("frequency");
       freqScale[F("scale")] = FFTScalingMode;
@@ -2729,7 +2719,7 @@ class AudioReactive : public Usermod {
       //WLEDMM: experimental settings
       configComplete &= getJsonValue(top["experiments"][F("micLev")], micLevelMethod);
       configComplete &= getJsonValue(top["experiments"][F("freqDist")], freqDist);
-      configComplete &= getJsonValue(top["experiments"][F("freqRMS")],  averageByRMS);
+      //configComplete &= getJsonValue(top["experiments"][F("freqRMS")],  averageByRMS);
 
       configComplete &= getJsonValue(top["frequency"][F("scale")], FFTScalingMode);
       configComplete &= getJsonValue(top["frequency"][F("profile")], pinkIndex);  //WLEDMM
@@ -2748,7 +2738,8 @@ class AudioReactive : public Usermod {
 
     void appendConfigData()
     {
-      oappend(SET_F("addInfo('AudioReactive:help',0,'<button onclick=\"location.href=&quot;https://mm.kno.wled.ge/soundreactive/Sound-Settings&quot;\" type=\"button\">?</button>');"));
+      oappend(SET_F("ux='AudioReactive';")); // fingers crossed that "ux" isn't already used as JS var, html post parameter or css style
+      oappend(SET_F("addInfo(ux+':help',0,'<button onclick=\"location.href=&quot;https://mm.kno.wled.ge/soundreactive/Sound-Settings&quot;\" type=\"button\">?</button>');"));
 #ifdef ARDUINO_ARCH_ESP32      
       //WLEDMM: add defaults
       #if !defined(CONFIG_IDF_TARGET_ESP32S2) && !defined(CONFIG_IDF_TARGET_ESP32C3) && !defined(CONFIG_IDF_TARGET_ESP32S3)  // -S3/-S2/-C3 don't support analog audio
@@ -2833,10 +2824,10 @@ class AudioReactive : public Usermod {
       oappend(SET_F("addOption(dd,'RightShift',1);"));
       oappend(SET_F("addInfo('AudioReactive:experiments:freqDist',1,'☾');"));
 
-      oappend(SET_F("dd=addDropdown('AudioReactive','experiments:freqRMS');"));
-      oappend(SET_F("addOption(dd,'Off  (⎌)',0);"));
-      oappend(SET_F("addOption(dd,'On',1);"));
-      oappend(SET_F("addInfo('AudioReactive:experiments:freqRMS',1,'☾');"));
+      //oappend(SET_F("dd=addDropdown('AudioReactive','experiments:freqRMS');"));
+      //oappend(SET_F("addOption(dd,'Off  (⎌)',0);"));
+      //oappend(SET_F("addOption(dd,'On',1);"));
+      //oappend(SET_F("addInfo('AudioReactive:experiments:freqRMS',1,'☾');"));
 
       oappend(SET_F("dd=addDropdown('AudioReactive','dynamics:limiter');"));
       oappend(SET_F("addOption(dd,'Off',0);"));
